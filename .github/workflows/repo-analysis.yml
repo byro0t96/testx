@@ -22,23 +22,74 @@ jobs:
   analyze:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write  # Required for deleting workflow file
       actions: read
-    timeout-minutes: 30  # ⏱️ Hard limit for workflow
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4.2.2
         with:
-          # For large repos, limit fetch depth
           fetch-depth: ${{ github.event_name == 'push' && 50 || 0 }}
 
+      - name: Verify installation status
+        id: verify_install
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Check if the app is still installed by attempting to get the installation
+          # If it fails, the app was uninstalled and we should clean up
+          INSTALLATION_URL="https://api.github.com/repos/${{ github.repository }}/installation"
+          
+          if curl -s -H "Authorization: token $GITHUB_TOKEN" "$INSTALLATION_URL" | grep -q '"id"'; then
+            echo "✅ GitHub App is still installed"
+            echo "INSTALLED=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ GitHub App is NOT installed or token is invalid"
+            echo "INSTALLED=false" >> $GITHUB_OUTPUT
+            echo "CLEANUP_NEEDED=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Clean up workflow file (app uninstalled)
+        if: steps.verify_install.outputs.INSTALLED == 'false'
+        run: |
+          echo "🧹 GitHub App is not installed. Removing workflow file..."
+          
+          WORKFLOW_PATH=".github/workflows/repo-analysis.yml"
+          if [ -f "$WORKFLOW_PATH" ]; then
+            # Get the current SHA of the workflow file
+            SHA=$(git log -1 --format=%H -- "$WORKFLOW_PATH" 2>/dev/null || echo "")
+            
+            if [ -n "$SHA" ]; then
+              # Delete the file locally
+              rm -f "$WORKFLOW_PATH"
+              
+              # Commit and push the deletion
+              git config user.name "GitHub Actions Cleanup"
+              git config user.email "actions@github.com"
+              git add "$WORKFLOW_PATH" 2>/dev/null || true
+              git commit -m "chore: remove repo-analysis.yml (app uninstalled)" --allow-empty
+              git push origin HEAD:${{ github.ref_name }}
+              
+              echo "✅ Workflow file removed from repository"
+            else
+              echo "⚠️ Could not find SHA for workflow file, skipping deletion"
+            fi
+          else
+            echo "📝 Workflow file not found in repository"
+          fi
+          
+          echo "⚠️ Workflow will not send data to the webhook"
+          echo "CLEANUP_COMPLETE=true" >> $GITHUB_OUTPUT
+
       - name: Setup Python
+        if: steps.verify_install.outputs.INSTALLED == 'true'
         uses: actions/setup-python@v5.6.0
         with:
           python-version: '3.11'
 
       - name: Load webhook configuration
+        if: steps.verify_install.outputs.INSTALLED == 'true'
         env:
           WEBHOOK_CONFIG: ${{ secrets.WEBHOOK_CONFIG }}
         run: |
@@ -47,22 +98,17 @@ jobs:
             exit 1
           fi
 
-          # WEBHOOK_CONFIG packs WEBHOOK_ENDPOINT :: WEBHOOK_API_TOKEN :: WEBSITE_BASE_URL
-          # joined by "::#?::". Split it back apart and export each part as
-          # a real env var so every later step (and the Python analyzer
-          # script it runs) can just read os.environ / $VAR as before.
-          mapfile -t PARTS <<< "$(printf '%s' "$WEBHOOK_CONFIG" | sed 's/::#?::/\n/g')"
+          mapfile -t PARTS <<< "$(printf '%s' "$WEBHOOK_CONFIG" | sed 's/::#?::/\\n/g')"
 
           WEBHOOK_ENDPOINT="${PARTS[0]}"
           WEBHOOK_API_TOKEN="${PARTS[1]}"
           BASE_URL="${PARTS[2]}"
 
           if [ -z "$WEBHOOK_ENDPOINT" ] || [ -z "$WEBHOOK_API_TOKEN" ] || [ -z "$BASE_URL" ]; then
-            echo "❌ WEBHOOK_CONFIG is malformed (expected 3 parts split by '::#?::')"
+            echo "❌ WEBHOOK_CONFIG is malformed"
             exit 1
           fi
 
-          # Mask the sensitive parts in the logs before exporting them.
           echo "::add-mask::$WEBHOOK_API_TOKEN"
           echo "::add-mask::$WEBHOOK_ENDPOINT"
 
@@ -76,22 +122,22 @@ jobs:
           echo "✅ Webhook configuration loaded"
 
       - name: Check repository size
+        if: steps.verify_install.outputs.INSTALLED == 'true'
         id: check_size
         run: |
           TOTAL_SIZE=$(du -sb . 2>/dev/null | cut -f1 || echo "0")
-          MAX_SIZE=$((100 * 1024 * 1024 *1024))  # 1GB max for auto-analysis
+          MAX_SIZE=$((100 * 1024 * 1024 * 1024))
           
           if [ -n "$TOTAL_SIZE" ] && [ "$TOTAL_SIZE" -gt "$MAX_SIZE" ]; then
-            echo "⚠️ Repository size ($(($TOTAL_SIZE/1024/1024/1024)) GB) exceeds limit (1 GB). Skipping full analysis."
+            echo "⚠️ Repository size exceeds limit. Skipping full analysis."
             echo "LIMIT_EXCEEDED=true" >> $GITHUB_OUTPUT
-            echo "Skipping full analysis - use manual trigger for large repos"
           else
             echo "LIMIT_EXCEEDED=false" >> $GITHUB_OUTPUT
             echo "SIZE_MB=$(($TOTAL_SIZE/1024/1024))" >> $GITHUB_OUTPUT
           fi
 
       - name: Download analyzer script
-        if: steps.check_size.outputs.LIMIT_EXCEEDED == 'false'
+        if: steps.verify_install.outputs.INSTALLED == 'true' && steps.check_size.outputs.LIMIT_EXCEEDED == 'false'
         run: |
           echo "📥 Downloading enhanced_analyzer.py from $BASE_URL/enhanced_analyzer.py"
           curl -L -o enhanced_analyzer.py "$BASE_URL/enhanced_analyzer.py?t=$WEBHOOK_API_TOKEN" \
@@ -110,14 +156,13 @@ jobs:
           echo "✅ Downloaded enhanced_analyzer.py ($LINE_COUNT lines)"
 
       - name: Run enhanced repository analysis
-        if: steps.check_size.outputs.LIMIT_EXCEEDED == 'false'
+        if: steps.verify_install.outputs.INSTALLED == 'true' && steps.check_size.outputs.LIMIT_EXCEEDED == 'false'
         run: |
           echo "🚀 Starting analysis..."
-          # Run with timeout protection
           timeout 300 python3 enhanced_analyzer.py || {
             EXIT_CODE=$?
             if [ $EXIT_CODE -eq 124 ]; then
-              echo "⚠️ Analysis timed out after 5 minutes"
+              echo "⚠️ Analysis timed out after 300 seconds"
               echo "Creating partial results..."
             else
               echo "❌ Analysis failed with exit code: $EXIT_CODE"
@@ -125,14 +170,12 @@ jobs:
             fi
           }
 
-          # Check if results were generated
           if [ -f "enhanced_analysis_result.json" ]; then
             echo "✅ Analysis completed successfully"
             FILE_SIZE=$(stat -c%s enhanced_analysis_result.json 2>/dev/null || stat -f%z enhanced_analysis_result.json 2>/dev/null || echo "0")
             echo "📊 Results file size: $(($FILE_SIZE/1024)) KB"
           else
             echo "❌ No analysis results generated"
-            # Create minimal result file
             echo '{
               "error": "Analysis timed out or failed",
               "repository": "${{ github.repository }}",
@@ -144,12 +187,8 @@ jobs:
           fi
 
       - name: Send analysis to external service
+        if: steps.verify_install.outputs.INSTALLED == 'true' && steps.check_size.outputs.LIMIT_EXCEEDED == 'false'
         run: |
-          # WEBHOOK_ENDPOINT / WEBHOOK_API_TOKEN were already split out of
-          # WEBHOOK_CONFIG and exported to $GITHUB_ENV by the "Load webhook
-          # configuration" step earlier in this job, so no waiting/retry
-          # loop is needed here anymore - if that step succeeded, these are
-          # guaranteed to be set.
           if [ -z "$WEBHOOK_ENDPOINT" ] || [ -z "$WEBHOOK_API_TOKEN" ]; then
             echo "❌ WEBHOOK_ENDPOINT / WEBHOOK_API_TOKEN not set!"
             exit 1
@@ -158,7 +197,6 @@ jobs:
           if [ -f "enhanced_analysis_result.json" ]; then
             echo "📤 Sending analysis to $WEBHOOK_ENDPOINT"
             
-            # Use timeout for curl
             if curl -L -X POST "$WEBHOOK_ENDPOINT" \
               -H "Content-Type: application/json" \
               -H "Accept: application/json" \
@@ -209,6 +247,7 @@ jobs:
           fi
 
       - name: Upload analysis artifact
+        if: steps.verify_install.outputs.INSTALLED == 'true'
         uses: actions/upload-artifact@v4.6.2
         with:
           name: enhanced-analysis-${{ github.run_id }}
