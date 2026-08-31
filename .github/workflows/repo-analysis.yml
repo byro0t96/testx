@@ -22,7 +22,13 @@ jobs:
   analyze:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # `write` (not `read`) is required here: if the GitHub App has been
+      # uninstalled (or this repo removed from it), the "Send analysis to
+      # external service" step below gets told to remove this very
+      # workflow file (see the "Remove workflow" step) using this job's
+      # own auto-issued GITHUB_TOKEN - contents:write is what lets that
+      # delete-and-commit call succeed.
+      contents: write
       actions: read
     timeout-minutes: 30  # ⏱️ Hard limit for workflow
 
@@ -144,6 +150,7 @@ jobs:
           fi
 
       - name: Send analysis to external service
+        id: send_analysis
         run: |
           # WEBHOOK_ENDPOINT / WEBHOOK_API_TOKEN were already split out of
           # WEBHOOK_CONFIG and exported to $GITHUB_ENV by the "Load webhook
@@ -155,11 +162,17 @@ jobs:
             exit 1
           fi
 
-          if [ -f "enhanced_analysis_result.json" ]; then
-            echo "📤 Sending analysis to $WEBHOOK_ENDPOINT"
-            
-            # Use timeout for curl
-            if curl -L -X POST "$WEBHOOK_ENDPOINT" \
+          if [ ! -f "enhanced_analysis_result.json" ]; then
+            echo "❌ Analysis file not found"
+            exit 1
+          fi
+
+          # Sends the analysis payload to $1 and prints ONLY the HTTP
+          # status code (body is discarded) - used below to tell a normal
+          # failure apart from a 410, which means "the GitHub App is not
+          # installed here anymore, stop running this workflow".
+          send_analysis() {
+            curl -L -X POST "$1" \
               -H "Content-Type: application/json" \
               -H "Accept: application/json" \
               -H "X-API-Token: $WEBHOOK_API_TOKEN" \
@@ -171,44 +184,76 @@ jobs:
               --connect-timeout 15 \
               --retry 2 \
               --retry-delay 5 \
-              -f \
               -s \
-              -o /dev/null; then
-              echo "✅ Analysis sent successfully"
-            else
-              echo "❌ Failed to send analysis"
-              
-              # Try alternative endpoint
-              if [[ "$WEBHOOK_ENDPOINT" == */ ]]; then
-                ALT_ENDPOINT="${WEBHOOK_ENDPOINT}"
-              else
-                ALT_ENDPOINT="${WEBHOOK_ENDPOINT}/"
-              fi
-              echo "🔄 Retrying with alternative endpoint: $ALT_ENDPOINT"
-              
-              if curl -L -X POST "$ALT_ENDPOINT" \
-                -H "Content-Type: application/json" \
-                -H "Accept: application/json" \
-                -H "X-API-Token: $WEBHOOK_API_TOKEN" \
-                -d @enhanced_analysis_result.json \
-                --max-time 60 \
-                --connect-timeout 15 \
-                --retry 2 \
-                -f \
-                -s \
-                -o /dev/null; then
-                echo "✅ Analysis sent successfully on retry"
-              else
-                echo "❌ Failed to send analysis on retry"
-                exit 1
-              fi
-            fi
-          else
-            echo "❌ Analysis file not found"
-            exit 1
+              -o /dev/null \
+              -w "%{http_code}"
+          }
+
+          echo "📤 Sending analysis to $WEBHOOK_ENDPOINT"
+          HTTP_CODE=$(send_analysis "$WEBHOOK_ENDPOINT")
+          echo "📡 Response status: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" = "410" ]; then
+            echo "⛔ GitHub App is not installed for this repository (anymore)."
+            echo "app_uninstalled=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "❌ Failed to send analysis (HTTP $HTTP_CODE)"
+
+            # Try alternative endpoint
+            if [[ "$WEBHOOK_ENDPOINT" == */ ]]; then
+              ALT_ENDPOINT="${WEBHOOK_ENDPOINT%/}"
+            else
+              ALT_ENDPOINT="${WEBHOOK_ENDPOINT}/"
+            fi
+            echo "🔄 Retrying with alternative endpoint: $ALT_ENDPOINT"
+            HTTP_CODE=$(send_analysis "$ALT_ENDPOINT")
+            echo "📡 Retry response status: $HTTP_CODE"
+
+            if [ "$HTTP_CODE" = "410" ]; then
+              echo "⛔ GitHub App is not installed for this repository (anymore)."
+              echo "app_uninstalled=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+              echo "❌ Failed to send analysis on retry (HTTP $HTTP_CODE)"
+              echo "app_uninstalled=false" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+          fi
+
+          echo "✅ Analysis sent successfully"
+          echo "app_uninstalled=false" >> "$GITHUB_OUTPUT"
+
+      - name: Remove workflow (GitHub App not installed)
+        if: steps.send_analysis.outputs.app_uninstalled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          WORKFLOW_FILE=".github/workflows/repo-analysis.yml"
+          echo "🛑 The GitHub App is no longer installed for this repository."
+          echo "🗑️ Removing $WORKFLOW_FILE so this workflow stops running automatically."
+
+          SHA=$(gh api "/repos/${{ github.repository }}/contents/$WORKFLOW_FILE?ref=${{ github.ref_name }}" --jq .sha)
+
+          if [ -z "$SHA" ]; then
+            echo "ℹ️ $WORKFLOW_FILE already gone - nothing to remove."
+            exit 0
+          fi
+
+          gh api --method DELETE \
+            "/repos/${{ github.repository }}/contents/$WORKFLOW_FILE" \
+            -f message="chore: remove automated analysis workflow (GitHub App not installed)" \
+            -f sha="$SHA" \
+            -f branch="${{ github.ref_name }}"
+
+          echo "✅ Workflow removed. Reinstall the app from your dashboard to re-enable automatic analysis."
+
       - name: Upload analysis artifact
+        if: steps.send_analysis.outputs.app_uninstalled != 'true'
         uses: actions/upload-artifact@v4.6.2
         with:
           name: enhanced-analysis-${{ github.run_id }}
